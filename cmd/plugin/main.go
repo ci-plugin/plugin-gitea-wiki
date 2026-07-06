@@ -87,7 +87,7 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	p.baseURL = strings.TrimRight(s.GiteaURL, "/")
 	p.client = &http.Client{Timeout: 30 * time.Second}
 
-	exists, existingContent := p.pageExists(ctx)
+	exists := p.pageExists(ctx)
 
 	switch s.WikiMode {
 	case "skip":
@@ -95,10 +95,10 @@ func (p *Plugin) Execute(ctx context.Context) error {
 			log.Info().Str("page", s.Page).Msg("page exists, skipping (wiki_mode=skip)")
 			return nil
 		}
-		return p.create(ctx)
+		return p.upsert(ctx)
 	case "append":
 		if exists {
-			s.Content = existingContent + "\n\n---\n\n" + s.Content
+			s.Content = p.getPageContent(ctx) + "\n\n---\n\n" + s.Content
 		}
 		return p.upsert(ctx)
 	default: // overwrite
@@ -106,79 +106,72 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	}
 }
 
-func (p *Plugin) upsert(ctx context.Context) error {
-	s := p.Settings
-	body := map[string]string{
-		"title":          s.Page,
-		"content_base64": base64.StdEncoding.EncodeToString([]byte(s.Content)),
+func (p *Plugin) payload() []byte {
+	b := map[string]string{
+		"title":          p.Settings.Page,
+		"content_base64": base64.StdEncoding.EncodeToString([]byte(p.Settings.Content)),
 	}
-	payload, _ := json.Marshal(body)
+	j, _ := json.Marshal(b)
+	return j
+}
 
-	log.Info().Str("page", s.Page).Int("bytes", len(s.Content)).Msg("publishing")
+// upsert tries PATCH first, then falls back to POST.
+func (p *Plugin) upsert(ctx context.Context) error {
+	log.Info().Str("page", p.Settings.Page).Int("bytes", len(p.Settings.Content)).Msg("publishing")
 
-	// PATCH existing page
-	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/page/%s", p.baseURL, s.Repo, url.PathEscape(s.Page))
-	status, respBody := p.do(ctx, http.MethodPatch, u, payload)
+	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/page/%s",
+		p.baseURL, p.Settings.Repo, url.PathEscape(p.Settings.Page))
+	status, body := p.do(ctx, http.MethodPatch, u, p.payload())
 	if status == 200 || status == 201 {
 		log.Info().Int("status", status).Msg("wiki page updated")
 		return nil
 	}
-	log.Info().Int("status", status).Str("body", respBody).Msg("patch failed, trying POST")
+	if status != 404 {
+		return fmt.Errorf("wiki PATCH returned %d: %s", status, body)
+	}
 
-	// POST create new
-	u = fmt.Sprintf("%s/api/v1/repos/%s/wiki/new", p.baseURL, s.Repo)
-	status, respBody = p.do(ctx, http.MethodPost, u, payload)
+	u = fmt.Sprintf("%s/api/v1/repos/%s/wiki/new", p.baseURL, p.Settings.Repo)
+	status, body = p.do(ctx, http.MethodPost, u, p.payload())
 	if status == 200 || status == 201 {
 		log.Info().Int("status", status).Msg("wiki page created")
 		return nil
 	}
-	return fmt.Errorf("wiki API returned %d: %s", status, respBody)
+	return fmt.Errorf("wiki POST returned %d: %s", status, body)
 }
 
-func (p *Plugin) create(ctx context.Context) error {
-	s := p.Settings
-	body := map[string]string{
-		"title":          s.Page,
-		"content_base64": base64.StdEncoding.EncodeToString([]byte(s.Content)),
-	}
-	payload, _ := json.Marshal(body)
-
-	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/new", p.baseURL, s.Repo)
-	status, respBody := p.do(ctx, http.MethodPost, u, payload)
-	if status == 200 || status == 201 {
-		log.Info().Int("status", status).Msg("wiki page created")
-		return nil
-	}
-	return fmt.Errorf("wiki API returned %d: %s", status, respBody)
-}
-
-// pageExists checks if the wiki page exists and returns its decoded content.
-func (p *Plugin) pageExists(ctx context.Context) (bool, string) {
+// pageExists returns true if the wiki page already exists.
+func (p *Plugin) pageExists(ctx context.Context) bool {
 	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/page/%s",
 		p.baseURL, p.Settings.Repo, url.PathEscape(p.Settings.Page))
-	status, respBody := p.do(ctx, http.MethodGet, u, nil)
-	if status != 200 {
-		return false, ""
-	}
+	status, _ := p.do(ctx, http.MethodGet, u, nil)
+	return status == 200
+}
+
+// getPageContent fetches and decodes the current content of the wiki page.
+func (p *Plugin) getPageContent(ctx context.Context) string {
+	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/page/%s",
+		p.baseURL, p.Settings.Repo, url.PathEscape(p.Settings.Page))
+	_, body := p.do(ctx, http.MethodGet, u, nil)
 	var result struct {
 		ContentBase64 string `json:"content_base64"`
 	}
-	if err := json.Unmarshal([]byte(respBody), &result); err != nil {
-		return true, ""
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		return ""
 	}
-	decoded, err := base64.StdEncoding.DecodeString(result.ContentBase64)
-	if err != nil {
-		return true, ""
-	}
-	return true, string(decoded)
+	decoded, _ := base64.StdEncoding.DecodeString(result.ContentBase64)
+	return string(decoded)
 }
 
-func (p *Plugin) do(ctx context.Context, method, url string, body []byte) (int, string) {
+// do sends an HTTP request and returns status code + trimmed response body.
+func (p *Plugin) do(ctx context.Context, method, url string, payload []byte) (int, string) {
 	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+	if payload != nil {
+		reader = bytes.NewReader(payload)
 	}
-	req, _ := http.NewRequestWithContext(ctx, method, url, reader)
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		return 0, err.Error()
+	}
 	req.Header.Set("Authorization", "token "+p.Settings.GiteaToken)
 	req.Header.Set("Content-Type", "application/json")
 
