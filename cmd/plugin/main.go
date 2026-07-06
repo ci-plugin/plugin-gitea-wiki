@@ -1,16 +1,17 @@
-// Package main is a Drone / Woodpecker plugin that syncs content to Gitea wiki pages.
-//
-// Gitea wiki is a git repo (<repo>.wiki.git). This plugin clones it, writes a
-// markdown file, commits, and pushes — a simple git-backed wiki publisher.
+// Package main is a Drone / Woodpecker plugin that writes pages to Gitea wiki
+// via the REST API (POST /repos/{owner}/{repo}/wiki/new).
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
+	"io"
+	"net/http"
 	"strings"
+	"time"
 
 	"codeberg.org/woodpecker-plugins/go-plugin"
 	"github.com/rs/zerolog/log"
@@ -19,187 +20,112 @@ import (
 
 // Settings holds all plugin configuration from workflow settings.
 type Settings struct {
-	GiteaURL   string // Gitea instance URL (e.g., https://gitea.example.com)
-	GiteaToken string // API token for git auth
-	WikiRepo   string // target repo: "owner/repo"
-	Page       string // wiki page path, e.g. "code-review/2024-07-06.md"
-	Content    string // markdown content to write
-	Message    string // commit message (default: auto-generated)
-	GitUser    string // commit author name (default: plugin-gitea-wiki)
-	GitEmail   string // commit author email (default: plugin@ci)
+	GiteaURL   string // https://gitea.example.com
+	GiteaToken string // API token
+	Repo       string // owner/repo
+	Page       string // wiki page title, e.g. "code-review/2024-07-06"
+	Content    string // markdown content
 }
 
 func defaults() *Settings {
-	return &Settings{
-		GitUser:  "plugin-gitea-wiki",
-		GitEmail: "plugin@ci",
-	}
+	return &Settings{}
 }
 
-// Plugin wraps the base plugin with parsed settings.
 type Plugin struct {
 	*plugin.Plugin
 	Settings *Settings
 }
 
-// Flags maps PLUGIN_* env vars to Settings fields.
 func (p *Plugin) Flags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{
 			Name:        "gitea-url",
-			Usage:       "Gitea instance URL (e.g., https://gitea.example.com)",
-			Sources:     cli.EnvVars("PLUGIN_GITEA_URL", "GITEA_URL"),
+			Usage:       "Gitea instance URL (default: CI_SYSTEM_URL)",
+			Sources:     cli.EnvVars("PLUGIN_GITEA_URL", "CI_SYSTEM_URL"),
 			Destination: &p.Settings.GiteaURL,
 		},
 		&cli.StringFlag{
 			Name:        "gitea-token",
-			Usage:       "Gitea API token for git auth",
+			Usage:       "Gitea API token",
 			Sources:     cli.EnvVars("PLUGIN_GITEA_TOKEN"),
 			Destination: &p.Settings.GiteaToken,
 		},
 		&cli.StringFlag{
-			Name:        "wiki-repo",
+			Name:        "repo",
 			Usage:       "target repository (owner/repo)",
-			Sources:     cli.EnvVars("PLUGIN_WIKI_REPO", "CI_REPO"),
-			Destination: &p.Settings.WikiRepo,
+			Sources:     cli.EnvVars("PLUGIN_REPO", "CI_REPO"),
+			Destination: &p.Settings.Repo,
 		},
 		&cli.StringFlag{
 			Name:        "page",
-			Usage:       "wiki page path, e.g. code-review/2024-07-06.md",
+			Usage:       "wiki page title, e.g. Code-Review/2024-07-06",
 			Sources:     cli.EnvVars("PLUGIN_PAGE"),
 			Destination: &p.Settings.Page,
 		},
 		&cli.StringFlag{
 			Name:        "content",
-			Usage:       "markdown content to write to the wiki page",
+			Usage:       "markdown content for the wiki page",
 			Sources:     cli.EnvVars("PLUGIN_CONTENT"),
 			Destination: &p.Settings.Content,
-		},
-		&cli.StringFlag{
-			Name:        "message",
-			Usage:       "commit message (default: auto-generated)",
-			Sources:     cli.EnvVars("PLUGIN_MESSAGE"),
-			Destination: &p.Settings.Message,
-		},
-		&cli.StringFlag{
-			Name:        "git-user",
-			Usage:       "commit author name",
-			Value:       p.Settings.GitUser,
-			Sources:     cli.EnvVars("PLUGIN_GIT_USER"),
-			Destination: &p.Settings.GitUser,
-		},
-		&cli.StringFlag{
-			Name:        "git-email",
-			Usage:       "commit author email",
-			Value:       p.Settings.GitEmail,
-			Sources:     cli.EnvVars("PLUGIN_GIT_EMAIL"),
-			Destination: &p.Settings.GitEmail,
 		},
 	}
 }
 
-// Execute clones the wiki repo, writes the page, commits, and pushes.
 func (p *Plugin) Execute(ctx context.Context) error {
 	s := p.Settings
-
 	if err := s.validate(); err != nil {
 		return fmt.Errorf("configuration error: %w", err)
 	}
 
-	if s.Message == "" {
-		s.Message = fmt.Sprintf("Update wiki page %s", s.Page)
+	// Gitea wiki API: content must be base64-encoded
+	body := map[string]string{
+		"title":   s.Page,
+		"content": base64.StdEncoding.EncodeToString([]byte(s.Content)),
 	}
+	payload, _ := json.Marshal(body)
 
-	workDir := "/tmp/wiki"
-	defer os.RemoveAll(workDir) //nolint:errcheck
+	apiURL := fmt.Sprintf("%s/api/v1/repos/%s/wiki/new",
+		strings.TrimRight(s.GiteaURL, "/"), s.Repo)
 
-	// Clone the wiki repo
-	wikiURL := fmt.Sprintf("%s/%s.wiki.git", s.GiteaURL, s.WikiRepo)
-	log.Info().Str("url", wikiURL).Msg("cloning wiki repo")
+	log.Info().Str("url", apiURL).Str("page", s.Page).Msg("creating wiki page")
 
-	if err := run(ctx, workDir, "git", "clone", "--depth", "1", wikiURL, "."); err != nil {
-		// Try without --depth 1 (older git or empty wiki)
-		log.Warn().Msg("shallow clone failed, retrying with full clone")
-		if err := run(ctx, workDir, "git", "clone", wikiURL, "."); err != nil {
-			return fmt.Errorf("clone wiki repo: %w", err)
-		}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
 	}
+	req.Header.Set("Authorization", "token "+s.GiteaToken)
+	req.Header.Set("Content-Type", "application/json")
 
-	// Write the page
-	pagePath := filepath.Join(workDir, s.Page)
-	if err := os.MkdirAll(filepath.Dir(pagePath), 0755); err != nil {
-		return fmt.Errorf("create page directory: %w", err)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("api call: %w", err)
 	}
-	if err := os.WriteFile(pagePath, []byte(s.Content), 0644); err != nil {
-		return fmt.Errorf("write page %s: %w", s.Page, err)
-	}
+	defer resp.Body.Close()
 
-	// Configure git with token-based auth
-	authURL := fmt.Sprintf("%s/%s.wiki.git", s.GiteaURL, s.WikiRepo)
-	escapedToken := strings.ReplaceAll(s.GiteaToken, "@", "%40")
-	escapedToken = strings.ReplaceAll(escapedToken, ":", "%3A")
-	pushURL := fmt.Sprintf("https://plugin:%s@%s",
-		escapedToken,
-		strings.TrimPrefix(authURL, "https://"))
-
-	if err := run(ctx, workDir, "git", "config", "user.name", s.GitUser); err != nil {
-		return fmt.Errorf("set git user: %w", err)
-	}
-	if err := run(ctx, workDir, "git", "config", "user.email", s.GitEmail); err != nil {
-		return fmt.Errorf("set git email: %w", err)
-	}
-
-	// Set the remote URL with token for push
-	if err := run(ctx, workDir, "git", "remote", "set-url", "origin", pushURL); err != nil {
-		return fmt.Errorf("set remote url: %w", err)
-	}
-
-	// Stage, commit, push
-	if err := run(ctx, workDir, "git", "add", s.Page); err != nil {
-		return fmt.Errorf("stage page: %w", err)
-	}
-	if err := run(ctx, workDir, "git", "commit", "-m", s.Message); err != nil {
-		log.Warn().Msg("commit (may be empty — page unchanged)")
-		// Don't fail if nothing to commit
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
+		log.Info().Str("page", s.Page).Msg("wiki page created")
 		return nil
 	}
-	if err := run(ctx, workDir, "git", "push"); err != nil {
-		return fmt.Errorf("push: %w", err)
-	}
 
-	log.Info().Str("page", s.Page).Msg("wiki page synced")
-	return nil
+	respBody, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("wiki API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 }
 
 func (s *Settings) validate() error {
-	if s.GiteaURL == "" {
-		return fmt.Errorf("gitea_url is required")
-	}
 	if s.GiteaToken == "" {
 		return fmt.Errorf("gitea_token is required")
 	}
-	if s.WikiRepo == "" {
-		return fmt.Errorf("wiki_repo is required")
+	if s.Repo == "" {
+		return fmt.Errorf("repo is required")
 	}
 	if s.Page == "" {
 		return fmt.Errorf("page is required")
 	}
 	if s.Content == "" {
-		return fmt.Errorf("content is required (markdown to write)")
+		return fmt.Errorf("content is required")
 	}
 	return nil
-}
-
-func run(ctx context.Context, dir, name string, args ...string) error {
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Dir = dir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(),
-		"GIT_TERMINAL_PROMPT=0",
-		"GIT_ASKPASS=echo",
-	)
-	return cmd.Run()
 }
 
 func main() {
@@ -207,7 +133,7 @@ func main() {
 	p := &Plugin{Settings: s}
 	p.Plugin = plugin.New(plugin.Options{
 		Name:        "plugin-gitea-wiki",
-		Description: "Sync content to Gitea wiki pages",
+		Description: "Publish pages to Gitea wiki via REST API",
 		Version:     "0.1.0",
 		Flags:       p.Flags(),
 		Execute:     p.Execute,

@@ -6,6 +6,6 @@ COPY cmd/plugin/ ./cmd/plugin/
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /plugin ./cmd/plugin/
 
 FROM alpine:3.21
-RUN apk add --no-cache git ca-certificates
+RUN apk add --no-cache ca-certificates
 COPY --from=builder /plugin /usr/local/bin/plugin-gitea-wiki
 ENTRYPOINT ["/usr/local/bin/plugin-gitea-wiki"]
