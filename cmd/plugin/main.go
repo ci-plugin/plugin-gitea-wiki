@@ -48,8 +48,8 @@ func (p *Plugin) Flags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:        "gitea-token",
-			Usage:       "Gitea API token",
-			Sources:     cli.EnvVars("PLUGIN_GITEA_TOKEN"),
+			Usage:       "Gitea API token (default: CI_JOB_TOKEN)",
+			Sources:     cli.EnvVars("PLUGIN_GITEA_TOKEN", "CI_JOB_TOKEN"),
 			Destination: &p.Settings.GiteaToken,
 		},
 		&cli.StringFlag{
@@ -130,9 +130,6 @@ func (p *Plugin) Execute(ctx context.Context) error {
 }
 
 func (s *Settings) validate() error {
-	if s.GiteaToken == "" {
-		return fmt.Errorf("gitea_token is required")
-	}
 	if s.Repo == "" {
 		return fmt.Errorf("repo is required")
 	}
