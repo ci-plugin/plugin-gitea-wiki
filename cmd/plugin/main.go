@@ -100,15 +100,15 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	// Gitea wiki API: content must be base64-encoded
 	body := map[string]string{
 		"title":   s.Page,
-		"content": base64.StdEncoding.EncodeToString([]byte(s.Content)),
+		"content_base64": base64.StdEncoding.EncodeToString([]byte(s.Content)),
 	}
 	payload, _ := json.Marshal(body)
 
 	log.Info().
 		Str("title", body["title"]).
 		Int("content_bytes", len(s.Content)).
-		Int("b64_len", len(body["content"])).
-		Str("b64_head", body["content"][:min(80, len(body["content"]))]).
+		Int("b64_len", len(body["content_base64"])).
+		Str("b64_head", body["content_base64"][:min(80, len(body["content_base64"]))]).
 		Msg("request payload")
 
 	baseURL := strings.TrimRight(s.GiteaURL, "/")
