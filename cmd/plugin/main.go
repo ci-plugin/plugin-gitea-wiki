@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -94,7 +95,7 @@ func (p *Plugin) Execute(ctx context.Context) error {
 		s.Content = string(data)
 	}
 
-		log.Info().Int("content_len", len(s.Content)).Msg("content to publish")
+	log.Info().Int("content_len", len(s.Content)).Msg("content to publish")
 
 	// Gitea wiki API: content must be base64-encoded
 	body := map[string]string{
@@ -103,35 +104,44 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	}
 	payload, _ := json.Marshal(body)
 
-	apiURL := fmt.Sprintf("%s/api/v1/repos/%s/wiki/new",
-		strings.TrimRight(s.GiteaURL, "/"), s.Repo)
+	baseURL := strings.TrimRight(s.GiteaURL, "/")
+	client := &http.Client{Timeout: 30 * time.Second}
 
-	log.Info().
-		Str("url", apiURL).
-		Str("page", s.Page).
-		Str("repo", s.Repo).
-		Int("token_len", len(s.GiteaToken)).
-		Msg("creating wiki page")
+	// Try PATCH (update) first, fall back to POST (create)
+	patchURL := fmt.Sprintf("%s/api/v1/repos/%s/wiki/%s",
+		baseURL, s.Repo, url.PathEscape(s.Page))
+	log.Info().Str("url", patchURL).Str("page", s.Page).Msg("updating wiki page")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(payload))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPatch, patchURL, bytes.NewReader(payload))
 	req.Header.Set("Authorization", "token "+s.GiteaToken)
 	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("api call: %w", err)
 	}
-	defer resp.Body.Close()
-
 	respBody, _ := io.ReadAll(resp.Body)
-	log.Info().
-		Int("status", resp.StatusCode).
-		Str("response", strings.TrimSpace(string(respBody))).
-		Msg("wiki API response")
+	resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		log.Info().Int("status", resp.StatusCode).Msg("wiki page updated")
+		return nil
+	}
+
+	// PATCH failed — create new page
+	log.Info().Int("status", resp.StatusCode).Str("response", strings.TrimSpace(string(respBody))).Msg("patch failed, trying POST")
+
+	createURL := fmt.Sprintf("%s/api/v1/repos/%s/wiki/new", baseURL, s.Repo)
+	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(payload))
+	req.Header.Set("Authorization", "token "+s.GiteaToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ = io.ReadAll(resp.Body)
+
+	log.Info().Int("status", resp.StatusCode).Str("response", strings.TrimSpace(string(respBody))).Msg("wiki create response")
 
 	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
 		log.Info().Str("page", s.Page).Msg("wiki page created")
