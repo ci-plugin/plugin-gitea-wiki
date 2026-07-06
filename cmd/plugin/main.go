@@ -117,7 +117,7 @@ func (p *Plugin) upsert(ctx context.Context) error {
 	log.Info().Str("page", s.Page).Int("bytes", len(s.Content)).Msg("publishing")
 
 	// PATCH existing page
-	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/%s", p.baseURL, s.Repo, url.PathEscape(s.Page))
+	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/page/%s", p.baseURL, s.Repo, url.PathEscape(s.Page))
 	status, respBody := p.do(ctx, http.MethodPatch, u, payload)
 	if status == 200 || status == 201 {
 		log.Info().Int("status", status).Msg("wiki page updated")
@@ -154,7 +154,7 @@ func (p *Plugin) create(ctx context.Context) error {
 
 // pageExists checks if the wiki page exists and returns its decoded content.
 func (p *Plugin) pageExists(ctx context.Context) (bool, string) {
-	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/%s",
+	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/page/%s",
 		p.baseURL, p.Settings.Repo, url.PathEscape(p.Settings.Page))
 	status, respBody := p.do(ctx, http.MethodGet, u, nil)
 	if status != 200 {
