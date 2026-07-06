@@ -104,7 +104,12 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	apiURL := fmt.Sprintf("%s/api/v1/repos/%s/wiki/new",
 		strings.TrimRight(s.GiteaURL, "/"), s.Repo)
 
-	log.Info().Str("url", apiURL).Str("page", s.Page).Msg("creating wiki page")
+	log.Info().
+		Str("url", apiURL).
+		Str("page", s.Page).
+		Str("repo", s.Repo).
+		Int("token_len", len(s.GiteaToken)).
+		Msg("creating wiki page")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(payload))
 	if err != nil {
@@ -120,12 +125,17 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
+	respBody, _ := io.ReadAll(resp.Body)
+	log.Info().
+		Int("status", resp.StatusCode).
+		Str("response", strings.TrimSpace(string(respBody))).
+		Msg("wiki API response")
+
 	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
 		log.Info().Str("page", s.Page).Msg("wiki page created")
 		return nil
 	}
 
-	respBody, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("wiki API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 }
 
