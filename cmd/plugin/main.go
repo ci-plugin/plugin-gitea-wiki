@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -20,11 +21,12 @@ import (
 
 // Settings holds all plugin configuration from workflow settings.
 type Settings struct {
-	GiteaURL   string // https://gitea.example.com
-	GiteaToken string // API token
-	Repo       string // owner/repo
-	Page       string // wiki page title, e.g. "code-review/2024-07-06"
-	Content    string // markdown content
+	GiteaURL    string // https://gitea.example.com
+	GiteaToken  string // API token
+	Repo        string // owner/repo
+	Page        string // wiki page title, e.g. "code-review/2024-07-06"
+	Content     string // markdown content (inline)
+	ContentFile string // path to file containing markdown content
 }
 
 func defaults() *Settings {
@@ -64,9 +66,15 @@ func (p *Plugin) Flags() []cli.Flag {
 		},
 		&cli.StringFlag{
 			Name:        "content",
-			Usage:       "markdown content for the wiki page",
+			Usage:       "markdown content (inline; use content_file for large content)",
 			Sources:     cli.EnvVars("PLUGIN_CONTENT"),
 			Destination: &p.Settings.Content,
+		},
+		&cli.StringFlag{
+			Name:        "content-file",
+			Usage:       "path to file containing markdown content",
+			Sources:     cli.EnvVars("PLUGIN_CONTENT_FILE"),
+			Destination: &p.Settings.ContentFile,
 		},
 	}
 }
@@ -75,6 +83,15 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	s := p.Settings
 	if err := s.validate(); err != nil {
 		return fmt.Errorf("configuration error: %w", err)
+	}
+
+	// Resolve content: file takes priority over inline
+	if s.ContentFile != "" {
+		data, err := os.ReadFile(s.ContentFile)
+		if err != nil {
+			return fmt.Errorf("read content_file %s: %w", s.ContentFile, err)
+		}
+		s.Content = string(data)
 	}
 
 	// Gitea wiki API: content must be base64-encoded
@@ -122,8 +139,8 @@ func (s *Settings) validate() error {
 	if s.Page == "" {
 		return fmt.Errorf("page is required")
 	}
-	if s.Content == "" {
-		return fmt.Errorf("content is required")
+	if s.Content == "" && s.ContentFile == "" {
+		return fmt.Errorf("content or content_file is required")
 	}
 	return nil
 }
