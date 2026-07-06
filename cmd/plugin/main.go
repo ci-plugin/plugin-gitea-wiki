@@ -42,14 +42,14 @@ func (p *Plugin) Flags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{
 			Name:        "gitea-url",
-			Usage:       "Gitea instance URL (default: CI_SYSTEM_URL)",
-			Sources:     cli.EnvVars("PLUGIN_GITEA_URL", "CI_SYSTEM_URL"),
+			Usage:       "Gitea instance URL (default: CI_FORGE_URL)",
+			Sources:     cli.EnvVars("PLUGIN_GITEA_URL", "CI_FORGE_URL"),
 			Destination: &p.Settings.GiteaURL,
 		},
 		&cli.StringFlag{
 			Name:        "gitea-token",
-			Usage:       "Gitea API token (default: CI_JOB_TOKEN)",
-			Sources:     cli.EnvVars("PLUGIN_GITEA_TOKEN", "CI_JOB_TOKEN"),
+			Usage:       "Gitea API token with write:repository scope",
+			Sources:     cli.EnvVars("PLUGIN_GITEA_TOKEN"),
 			Destination: &p.Settings.GiteaToken,
 		},
 		&cli.StringFlag{
@@ -140,6 +140,12 @@ func (p *Plugin) Execute(ctx context.Context) error {
 }
 
 func (s *Settings) validate() error {
+	if s.GiteaURL == "" {
+		return fmt.Errorf("gitea_url is required")
+	}
+	if s.GiteaToken == "" {
+		return fmt.Errorf("gitea_token is required")
+	}
 	if s.Repo == "" {
 		return fmt.Errorf("repo is required")
 	}
