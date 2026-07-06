@@ -94,6 +94,8 @@ func (p *Plugin) Execute(ctx context.Context) error {
 		s.Content = string(data)
 	}
 
+		log.Info().Int("content_len", len(s.Content)).Msg("content to publish")
+
 	// Gitea wiki API: content must be base64-encoded
 	body := map[string]string{
 		"title":   s.Page,
