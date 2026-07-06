@@ -1,5 +1,5 @@
 // Package main is a Drone / Woodpecker plugin that writes pages to Gitea wiki
-// via the REST API (POST /repos/{owner}/{repo}/wiki/new).
+// via the REST API.
 package main
 
 import (
@@ -20,62 +20,52 @@ import (
 	"github.com/urfave/cli/v3"
 )
 
-// Settings holds all plugin configuration from workflow settings.
 type Settings struct {
-	GiteaURL    string // https://gitea.example.com
-	GiteaToken  string // API token
-	Repo        string // owner/repo
-	Page        string // wiki page title, e.g. "code-review/2024-07-06"
-	Content     string // markdown content (inline)
-	ContentFile string // path to file containing markdown content
-}
-
-func defaults() *Settings {
-	return &Settings{}
+	GiteaURL    string
+	GiteaToken  string
+	Repo        string
+	Page        string
+	Content     string
+	ContentFile string
+	WikiMode    string // skip (default), overwrite, append
 }
 
 type Plugin struct {
 	*plugin.Plugin
 	Settings *Settings
+	client   *http.Client
+	baseURL  string
 }
 
 func (p *Plugin) Flags() []cli.Flag {
 	return []cli.Flag{
 		&cli.StringFlag{
-			Name:        "gitea-url",
-			Usage:       "Gitea instance URL (default: CI_FORGE_URL)",
-			Sources:     cli.EnvVars("PLUGIN_GITEA_URL", "CI_FORGE_URL"),
-			Destination: &p.Settings.GiteaURL,
+			Name: "gitea-url", Usage: "Gitea instance URL (default: CI_FORGE_URL)",
+			Sources: cli.EnvVars("PLUGIN_GITEA_URL", "CI_FORGE_URL"), Destination: &p.Settings.GiteaURL,
 		},
 		&cli.StringFlag{
-			Name:        "gitea-token",
-			Usage:       "Gitea API token with write:repository scope",
-			Sources:     cli.EnvVars("PLUGIN_GITEA_TOKEN"),
-			Destination: &p.Settings.GiteaToken,
+			Name: "gitea-token", Usage: "Gitea API token with write:repository scope",
+			Sources: cli.EnvVars("PLUGIN_GITEA_TOKEN"), Destination: &p.Settings.GiteaToken,
 		},
 		&cli.StringFlag{
-			Name:        "repo",
-			Usage:       "target repository (owner/repo)",
-			Sources:     cli.EnvVars("PLUGIN_REPO", "CI_REPO"),
-			Destination: &p.Settings.Repo,
+			Name: "repo", Usage: "target repository (owner/repo)",
+			Sources: cli.EnvVars("PLUGIN_REPO", "CI_REPO"), Destination: &p.Settings.Repo,
 		},
 		&cli.StringFlag{
-			Name:        "page",
-			Usage:       "wiki page title, e.g. Code-Review/2024-07-06",
-			Sources:     cli.EnvVars("PLUGIN_PAGE"),
-			Destination: &p.Settings.Page,
+			Name: "page", Usage: "wiki page title, e.g. Code-Review/2024-07-06",
+			Sources: cli.EnvVars("PLUGIN_PAGE"), Destination: &p.Settings.Page,
 		},
 		&cli.StringFlag{
-			Name:        "content",
-			Usage:       "markdown content (inline; use content_file for large content)",
-			Sources:     cli.EnvVars("PLUGIN_CONTENT"),
-			Destination: &p.Settings.Content,
+			Name: "content", Usage: "markdown content (inline; use content_file for large content)",
+			Sources: cli.EnvVars("PLUGIN_CONTENT"), Destination: &p.Settings.Content,
 		},
 		&cli.StringFlag{
-			Name:        "content-file",
-			Usage:       "path to file containing markdown content",
-			Sources:     cli.EnvVars("PLUGIN_CONTENT_FILE"),
-			Destination: &p.Settings.ContentFile,
+			Name: "content-file", Usage: "path to file containing markdown content",
+			Sources: cli.EnvVars("PLUGIN_CONTENT_FILE"), Destination: &p.Settings.ContentFile,
+		},
+		&cli.StringFlag{
+			Name: "wiki-mode", Usage: "existing page handling: skip (default), overwrite, append",
+			Value: "skip", Sources: cli.EnvVars("PLUGIN_WIKI_MODE"), Destination: &p.Settings.WikiMode,
 		},
 	}
 }
@@ -86,7 +76,6 @@ func (p *Plugin) Execute(ctx context.Context) error {
 		return fmt.Errorf("configuration error: %w", err)
 	}
 
-	// Resolve content: file takes priority over inline
 	if s.ContentFile != "" {
 		data, err := os.ReadFile(s.ContentFile)
 		if err != nil {
@@ -95,104 +84,137 @@ func (p *Plugin) Execute(ctx context.Context) error {
 		s.Content = string(data)
 	}
 
-	log.Info().Int("content_len", len(s.Content)).Msg("content to publish")
+	p.baseURL = strings.TrimRight(s.GiteaURL, "/")
+	p.client = &http.Client{Timeout: 30 * time.Second}
 
-	// Gitea wiki API: content must be base64-encoded
+	exists, existingContent := p.pageExists(ctx)
+
+	switch s.WikiMode {
+	case "skip":
+		if exists {
+			log.Info().Str("page", s.Page).Msg("page exists, skipping (wiki_mode=skip)")
+			return nil
+		}
+		return p.create(ctx)
+	case "append":
+		if exists {
+			s.Content = existingContent + "\n\n---\n\n" + s.Content
+		}
+		return p.upsert(ctx)
+	default: // overwrite
+		return p.upsert(ctx)
+	}
+}
+
+func (p *Plugin) upsert(ctx context.Context) error {
+	s := p.Settings
 	body := map[string]string{
-		"title":   s.Page,
+		"title":          s.Page,
 		"content_base64": base64.StdEncoding.EncodeToString([]byte(s.Content)),
 	}
 	payload, _ := json.Marshal(body)
 
-	log.Info().
-		Str("title", body["title"]).
-		Int("content_bytes", len(s.Content)).
-		Int("b64_len", len(body["content_base64"])).
-		Str("b64_head", body["content_base64"][:min(80, len(body["content_base64"]))]).
-		Msg("request payload")
+	log.Info().Str("page", s.Page).Int("bytes", len(s.Content)).Msg("publishing")
 
-	baseURL := strings.TrimRight(s.GiteaURL, "/")
-	client := &http.Client{Timeout: 30 * time.Second}
-
-	// Try PATCH (update) first, fall back to POST (create)
-	patchURL := fmt.Sprintf("%s/api/v1/repos/%s/wiki/%s",
-		baseURL, s.Repo, url.PathEscape(s.Page))
-	log.Info().Str("url", patchURL).Str("page", s.Page).Msg("updating wiki page")
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPatch, patchURL, bytes.NewReader(payload))
-	req.Header.Set("Authorization", "token "+s.GiteaToken)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("api call: %w", err)
-	}
-	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-		log.Info().Int("status", resp.StatusCode).Msg("wiki page updated")
+	// PATCH existing page
+	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/%s", p.baseURL, s.Repo, url.PathEscape(s.Page))
+	status, respBody := p.do(ctx, http.MethodPatch, u, payload)
+	if status == 200 || status == 201 {
+		log.Info().Int("status", status).Msg("wiki page updated")
 		return nil
 	}
+	log.Info().Int("status", status).Str("body", respBody).Msg("patch failed, trying POST")
 
-	// PATCH failed — create new page
-	log.Info().Int("status", resp.StatusCode).Str("response", strings.TrimSpace(string(respBody))).Msg("patch failed, trying POST")
+	// POST create new
+	u = fmt.Sprintf("%s/api/v1/repos/%s/wiki/new", p.baseURL, s.Repo)
+	status, respBody = p.do(ctx, http.MethodPost, u, payload)
+	if status == 200 || status == 201 {
+		log.Info().Int("status", status).Msg("wiki page created")
+		return nil
+	}
+	return fmt.Errorf("wiki API returned %d: %s", status, respBody)
+}
 
-	createURL := fmt.Sprintf("%s/api/v1/repos/%s/wiki/new", baseURL, s.Repo)
-	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(payload))
-	req.Header.Set("Authorization", "token "+s.GiteaToken)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err = client.Do(req)
+func (p *Plugin) create(ctx context.Context) error {
+	s := p.Settings
+	body := map[string]string{
+		"title":          s.Page,
+		"content_base64": base64.StdEncoding.EncodeToString([]byte(s.Content)),
+	}
+	payload, _ := json.Marshal(body)
+
+	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/new", p.baseURL, s.Repo)
+	status, respBody := p.do(ctx, http.MethodPost, u, payload)
+	if status == 200 || status == 201 {
+		log.Info().Int("status", status).Msg("wiki page created")
+		return nil
+	}
+	return fmt.Errorf("wiki API returned %d: %s", status, respBody)
+}
+
+// pageExists checks if the wiki page exists and returns its decoded content.
+func (p *Plugin) pageExists(ctx context.Context) (bool, string) {
+	u := fmt.Sprintf("%s/api/v1/repos/%s/wiki/%s",
+		p.baseURL, p.Settings.Repo, url.PathEscape(p.Settings.Page))
+	status, respBody := p.do(ctx, http.MethodGet, u, nil)
+	if status != 200 {
+		return false, ""
+	}
+	var result struct {
+		ContentBase64 string `json:"content_base64"`
+	}
+	if err := json.Unmarshal([]byte(respBody), &result); err != nil {
+		return true, ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(result.ContentBase64)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return true, ""
+	}
+	return true, string(decoded)
+}
+
+func (p *Plugin) do(ctx context.Context, method, url string, body []byte) (int, string) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, _ := http.NewRequestWithContext(ctx, method, url, reader)
+	req.Header.Set("Authorization", "token "+p.Settings.GiteaToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return 0, err.Error()
 	}
 	defer resp.Body.Close()
-	respBody, _ = io.ReadAll(resp.Body)
-
-	log.Info().Int("status", resp.StatusCode).Str("response", strings.TrimSpace(string(respBody))).Msg("wiki create response")
-
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusOK {
-		log.Info().Str("page", s.Page).Msg("wiki page created")
-		return nil
-	}
-
-	return fmt.Errorf("wiki API returned %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, strings.TrimSpace(string(b))
 }
 
 func (s *Settings) validate() error {
-	if s.GiteaURL == "" {
+	switch {
+	case s.GiteaURL == "":
 		return fmt.Errorf("gitea_url is required")
-	}
-	if s.GiteaToken == "" {
+	case s.GiteaToken == "":
 		return fmt.Errorf("gitea_token is required")
-	}
-	if s.Repo == "" {
+	case s.Repo == "":
 		return fmt.Errorf("repo is required")
-	}
-	if s.Page == "" {
+	case s.Page == "":
 		return fmt.Errorf("page is required")
-	}
-	if s.Content == "" && s.ContentFile == "" {
+	case s.Content == "" && s.ContentFile == "":
 		return fmt.Errorf("content or content_file is required")
+	case s.WikiMode != "skip" && s.WikiMode != "overwrite" && s.WikiMode != "append":
+		return fmt.Errorf("wiki_mode must be skip, overwrite, or append")
 	}
 	return nil
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func main() {
-	s := defaults()
-	p := &Plugin{Settings: s}
+	p := &Plugin{Settings: &Settings{}}
 	p.Plugin = plugin.New(plugin.Options{
-		Name:        "plugin-gitea-wiki",
+		Name: "plugin-gitea-wiki", Version: "0.1.0",
 		Description: "Publish pages to Gitea wiki via REST API",
-		Version:     "0.1.0",
-		Flags:       p.Flags(),
-		Execute:     p.Execute,
+		Flags: p.Flags(), Execute: p.Execute,
 	})
 	p.Run()
 }
