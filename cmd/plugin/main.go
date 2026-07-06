@@ -104,6 +104,13 @@ func (p *Plugin) Execute(ctx context.Context) error {
 	}
 	payload, _ := json.Marshal(body)
 
+	log.Info().
+		Str("title", body["title"]).
+		Int("content_bytes", len(s.Content)).
+		Int("b64_len", len(body["content"])).
+		Str("b64_head", body["content"][:min(80, len(body["content"]))]).
+		Msg("request payload")
+
 	baseURL := strings.TrimRight(s.GiteaURL, "/")
 	client := &http.Client{Timeout: 30 * time.Second}
 
@@ -168,6 +175,13 @@ func (s *Settings) validate() error {
 		return fmt.Errorf("content or content_file is required")
 	}
 	return nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
